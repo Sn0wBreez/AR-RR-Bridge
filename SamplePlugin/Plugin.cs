@@ -1,86 +1,100 @@
-﻿using Dalamud.Game.Command;
-using Dalamud.IoC;
-using Dalamud.Plugin;
-using System.IO;
+using Dalamud.Game.Text;
+using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Interface.Windowing;
+using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
-using SamplePlugin.Windows;
+using System;
 
-namespace SamplePlugin;
+namespace AutoRepricerBridge;
 
-public sealed class Plugin : IDalamudPlugin
+public sealed class AutoRepricerBridge : IDalamudPlugin
 {
-    [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
-    [PluginService] internal static ITextureProvider TextureProvider { get; private set; } = null!;
-    [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
-    [PluginService] internal static IClientState ClientState { get; private set; } = null!;
-    [PluginService] internal static IPlayerState PlayerState { get; private set; } = null!;
-    [PluginService] internal static IDataManager DataManager { get; private set; } = null!;
-    [PluginService] internal static IPluginLog Log { get; private set; } = null!;
+    public string Name => "AutoRepricer Bridge";
 
-    private const string CommandName = "/pmycommand";
+    private readonly WindowSystem windowSystem;
+    private ConfigWindow configWindow;
 
-    public Configuration Configuration { get; init; }
+    // ================== CONFIG ==================
+    public bool Enabled { get; set; } = true;
+    public string TriggerPhrase { get; set; } = "AutoRetainer"; // change if your exact message is different
+    public bool OnlyReprice { get; set; } = false; // true = /rr start price instead of full start
+    public int DelayMs { get; set; } = 1500; // safety delay after AutoRetainer finishes
 
-    public readonly WindowSystem WindowSystem = new("SamplePlugin");
-    private ConfigWindow ConfigWindow { get; init; }
-    private MainWindow MainWindow { get; init; }
+    private DateTime lastTrigger = DateTime.MinValue;
 
-    public Plugin()
+    public AutoRepricerBridge(IDalamudPluginInterface pluginInterface)
     {
-        Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        PluginInterface = pluginInterface;
 
-        // You might normally want to embed resources and load them from the manifest stream
-        var goatImagePath = Path.Combine(PluginInterface.AssemblyLocation.Directory?.FullName!, "goat.png");
+        // Load or create config
+        Config = pluginInterface.GetPluginConfig() as BridgeConfig ?? new BridgeConfig();
+        Config.Initialize(pluginInterface);
 
-        ConfigWindow = new ConfigWindow(this);
-        MainWindow = new MainWindow(this, goatImagePath);
+        // Sync config
+        Enabled = Config.Enabled;
+        TriggerPhrase = Config.TriggerPhrase;
+        OnlyReprice = Config.OnlyReprice;
+        DelayMs = Config.DelayMs;
 
-        WindowSystem.AddWindow(ConfigWindow);
-        WindowSystem.AddWindow(MainWindow);
+        windowSystem = new WindowSystem(Name);
+        configWindow = new ConfigWindow(this);
+        windowSystem.AddWindow(configWindow);
 
-        CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
+        // Register chat listener
+        Service.ChatGui.ChatMessage += OnChatMessage;
+
+        // Slash command to open config
+        pluginInterface.CommandManager.AddHandler("/arrb", new Dalamud.Game.Command.CommandInfo(OnCommand)
         {
-            HelpMessage = "A useful message to display in /xlhelp"
+            HelpMessage = "Open AutoRepricer Bridge config"
         });
-
-        // Tell the UI system that we want our windows to be drawn through the window system
-        PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
-
-        // This adds a button to the plugin installer entry of this plugin which allows
-        // toggling the display status of the configuration ui
-        PluginInterface.UiBuilder.OpenConfigUi += ToggleConfigUi;
-
-        // Adds another button doing the same but for the main ui of the plugin
-        PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
-
-        // Add a simple message to the log with level set to information
-        // Use /xllog to open the log window in-game
-        // Example Output: 00:57:54.959 | INF | [SamplePlugin] ===A cool log message from Sample Plugin===
-        Log.Information($"===A cool log message from {PluginInterface.Manifest.Name}===");
     }
+
+    private void OnChatMessage(XivChatType type, uint senderId, SeString sender, SeString message)
+    {
+        if (!Enabled) return;
+        if (DateTime.UtcNow - lastTrigger < TimeSpan.FromSeconds(10)) return; // anti-spam
+
+        var msg = message.ToString().ToLower();
+
+        if (msg.Contains(TriggerPhrase.ToLower()) &&
+            (msg.Contains("venture") || msg.Contains("ventures")) &&
+            (msg.Contains("assign") || msg.Contains("sent") || msg.Contains("complete")))
+        {
+            lastTrigger = DateTime.UtcNow;
+            Service.Framework.RunOnFrameworkThread(async () =>
+            {
+                await Task.Delay(DelayMs);
+                var cmd = OnlyReprice ? "/rr start price" : "/rr start";
+                Service.CommandManager.ProcessCommand(cmd);
+                Service.ChatGui.Print($"[AutoRepricer Bridge] Triggered → {cmd}");
+            });
+        }
+    }
+
+    private void OnCommand(string command, string args) => configWindow.IsOpen = true;
 
     public void Dispose()
     {
-        // Unregister all actions to not leak anything during disposal of plugin
-        PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
-        PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUi;
-        PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
-        
-        WindowSystem.RemoveAllWindows();
-
-        ConfigWindow.Dispose();
-        MainWindow.Dispose();
-
-        CommandManager.RemoveHandler(CommandName);
+        Service.ChatGui.ChatMessage -= OnChatMessage;
+        PluginInterface.CommandManager.RemoveHandler("/arrb");
+        windowSystem.RemoveAllWindows();
     }
 
-    private void OnCommand(string command, string args)
-    {
-        // In response to the slash command, toggle the display status of our main ui
-        MainWindow.Toggle();
-    }
-    
-    public void ToggleConfigUi() => ConfigWindow.Toggle();
-    public void ToggleMainUi() => MainWindow.Toggle();
+    // Static access
+    public static AutoRepricerBridge Plugin { get; private set; }
+    public static IDalamudPluginInterface PluginInterface { get; private set; }
+    public static BridgeConfig Config { get; private set; }
+}
+
+// Simple config class (add as BridgeConfig.cs in the same folder)
+public class BridgeConfig : Dalamud.Configuration.IPluginConfiguration
+{
+    public int Version { get; set; } = 1;
+    public bool Enabled { get; set; } = true;
+    public string TriggerPhrase { get; set; } = "AutoRetainer";
+    public bool OnlyReprice { get; set; } = false;
+    public int DelayMs { get; set; } = 1500;
+
+    public void Initialize(IDalamudPluginInterface pi) => pi.Create<BridgeConfig>().Save();
 }
